@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Check-in / Chấm công</title>
+<!-- Trang chấm công GPS của bot LINE Gig Work (bản 57). Trang tĩnh, KHÔNG chứa bí mật hay dữ liệu người lao động.
+     Mọi quyết định (ai, ca nào, có trong 100 m không) do máy chủ Apps Script làm sau khi xác thực idToken với LINE. -->
+<style>
+  :root { --bg:#f4f6f8; --card:#fff; --ink:#1d2329; --sub:#6b7680; --line:#e3e7eb; --green:#0A7D2C; --red:#B3261E; --blue:#1558B0; --orange:#B25E00; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", "Noto Sans", Roboto, sans-serif; }
+  main { max-width: 480px; margin: 0 auto; padding: 16px 16px calc(24px + env(safe-area-inset-bottom)); }
+  .vi { display: block; color: var(--sub); font-size: .9em; }
+  header { margin: 4px 0 14px; }
+  header h1 { font-size: 1.35rem; margin: 0; }
+  .site { display: inline-block; margin-top: 8px; padding: 4px 12px; border-radius: 999px; background: var(--ink); color: #fff; font-weight: 700; letter-spacing: .04em; }
+  .box { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; margin-bottom: 14px; }
+  #gps { display: flex; gap: 12px; align-items: flex-start; }
+  #gps .dot { flex: none; width: 12px; height: 12px; margin-top: 6px; border-radius: 50%; background: var(--orange); }
+  #gps.ok .dot { background: var(--green); }
+  #gps.bad .dot { background: var(--red); }
+  .btns { display: grid; gap: 12px; margin-bottom: 14px; }
+  button.big { width: 100%; min-height: 84px; border: 0; border-radius: 16px; color: #fff; font: inherit; font-size: 1.3rem; font-weight: 800; cursor: pointer; }
+  button.big .vi { color: rgba(255,255,255,.85); font-weight: 600; font-size: 1rem; }
+  #in { background: var(--green); }
+  #out { background: var(--blue); }
+  #in:disabled, #out:disabled { background: #b9c1c8; cursor: default; }
+  #res h2 { margin: 0 0 2px; font-size: 1.2rem; }
+  #res table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  #res td { padding: 6px 0; border-top: 1px solid var(--line); vertical-align: top; }
+  #res td.k { width: 42%; font-size: .85rem; font-weight: 700; color: #555; }
+  #res td.k .vi { font-weight: 400; }
+  #res td.v { font-weight: 700; white-space: pre-line; }
+  #res p, .foot { white-space: pre-line; }
+  .foot { font-size: .85rem; color: var(--sub); margin-top: 10px; }
+  a.tel { display: block; margin-top: 12px; padding: 14px; border-radius: 12px; background: var(--red); color: #fff; text-align: center; text-decoration: none; font-weight: 800; font-size: 1.15rem; }
+  a.tel .vi { color: rgba(255,255,255,.85); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Check-in / Check-out<span class="vi">Chấm công vào ca / ra ca</span></h1>
+    <span class="site" id="site">…</span>
+  </header>
+
+  <div class="box" id="gps"><span class="dot"></span><div id="gpsText">Starting…<span class="vi">Đang khởi động…</span></div></div>
+
+  <div class="btns" id="btns">
+    <button class="big" id="in" disabled>CHECK-IN<span class="vi">VÀO CA</span></button>
+    <button class="big" id="out" disabled>CHECK-OUT<span class="vi">RA CA</span></button>
+  </div>
+
+  <div class="box" id="res" hidden></div>
+</main>
+
+<script charset="utf-8" src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+<script>
+'use strict';
+/* ===== Cài đặt (không có bí mật) ===== */
+const LIFF_ID = '2012602458-bGZpoDhB';
+// URL web app Apps Script (…/exec) — cùng URL đã đặt làm webhook LINE. Công khai được: mọi yêu cầu phải kèm idToken LINE hợp lệ.
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbwlMrBIcfDNhy1NGT8uAaQtOt4Eu1gEMMD-kr_SKIB5zD0qAahH8ZorSWwloTO6aWsJ/exec';
+const TEL = '08048101987';
+const SITES = ['NNC', 'DDC', 'TOPOS'];
+const MAX_AGE_MS = 60000;      // vị trí cũ hơn 60 giây thì lấy lại trước khi gửi
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const two = (en, vi) => esc(en) + '<span class="vi">' + esc(vi) + '</span>';
+let site = '', fix = null, watchId = null, busy = false, ready = false;
+
+/* ?site=NNC — khi mở qua https://liff.line.me/<id>?site=NNC, LIFF có thể chuyển tham số qua liff.state trước khi init xong */
+function readSite() {
+  const q = new URLSearchParams(location.search);
+  let s = q.get('site');
+  if (!s && q.get('liff.state')) { try { s = new URLSearchParams(q.get('liff.state').replace(/^[^?]*\?/, '')).get('site'); } catch (e) {} }
+  s = String(s || '').toUpperCase();
+  return SITES.indexOf(s) >= 0 ? s : '';
+}
+
+function telLink() { return '<a class="tel" href="tel:' + TEL + '">☎ ' + TEL + '<span class="vi">Gọi văn phòng</span></a>'; }
+
+function showResult(r) {
+  const box = $('res'), color = r.code === 'already' ? 'var(--blue)' : r.ok ? 'var(--green)' : (r.color === '#B25E00' ? 'var(--orange)' : 'var(--red)');   // đã vào / đã ra rồi: màu xanh dương trung tính
+  let h = '<h2 style="color:' + color + '">' + two(r.title && r.title[0], r.title && r.title[1]) + '</h2>';
+  (r.paras || []).forEach(p => { h += '<p>' + two(p[0], p[1]) + '</p>'; });
+  if (r.rows && r.rows.length) h += '<table>' + r.rows.map(x => '<tr><td class="k">' + two(x[0], x[1]) + '</td><td class="v">' + esc(x[2]) + '</td></tr>').join('') + '</table>';
+  if (r.foot) h += '<div class="foot">' + esc(r.foot) + '</div>';
+  if (!r.ok || r.tel) h += telLink();
+  box.innerHTML = h; box.hidden = false;
+  box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function block(en, vi, en2, vi2) {
+  showResult({ ok: false, title: [en, vi], paras: en2 ? [[en2, vi2]] : [] });
+}
+function setGps(cls, en, vi) { $('gps').className = 'box ' + cls; $('gpsText').innerHTML = two(en, vi); }
+function setButtons() { const on = ready && !busy && !!fix; $('in').disabled = !on; $('out').disabled = !on; }
+
+/* ===== Vị trí ===== */
+function gpsError(err) {
+  fix = null; setButtons();
+  if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  const denied = err && err.code === 1;
+  setGps('bad', denied ? 'Location permission denied' : 'Cannot get GPS location', denied ? 'Bạn đã từ chối quyền vị trí' : 'Không lấy được vị trí GPS');
+  block('Cannot check in without GPS', 'Không chấm công được khi không có GPS',
+    'Turn on location (GPS) and allow LINE to use it, then scan the QR code again. If it still does not work, call the office.',
+    'Bật định vị (GPS) và cho phép LINE dùng vị trí, rồi quét lại mã QR. Nếu vẫn không được, hãy gọi văn phòng.');
+}
+function onFix(p) {
+  fix = { lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy, at: Date.now() };
+  const a = Math.round(fix.accuracy);
+  if (a > 200) setGps('', 'GPS is weak (±' + a + ' m). Move outside or near a window…', 'GPS còn yếu (±' + a + ' m). Ra ngoài trời hoặc gần cửa sổ…');
+  else setGps('ok', 'Location ready (±' + a + ' m)', 'Đã có vị trí (±' + a + ' m)');
+  setButtons();
+}
+function startGps() {
+  if (!('geolocation' in navigator)) return gpsError({ code: 2 });
+  setGps('', 'Getting your location…', 'Đang lấy vị trí…');
+  watchId = navigator.geolocation.watchPosition(onFix, gpsError, { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+}
+function freshFix() {
+  if (fix && Date.now() - fix.at < MAX_AGE_MS) return Promise.resolve(fix);
+  return new Promise((ok, no) => navigator.geolocation.getCurrentPosition(p => { onFix(p); ok(fix); }, e => { gpsError(e); no(e); }, { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 }));
+}
+
+/* ===== Gửi ===== */
+async function send(kind) {
+  if (busy) return;
+  busy = true; setButtons(); $('res').hidden = true;
+  setGps('ok', 'Sending…', 'Đang gửi…');
+  try {
+    const f = await freshFix();
+    const idToken = liff.getIDToken();
+    if (!idToken) { block('Cannot confirm your LINE account', 'Không xác nhận được tài khoản LINE', 'Close this page and scan the QR code again in LINE.', 'Đóng trang này và quét lại mã QR trong LINE.'); return; }
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 30000);
+    // text/plain = "simple request": trình duyệt không gửi preflight OPTIONS (Apps Script không trả lời OPTIONS).
+    // Apps Script trả 302 sang script.googleusercontent.com (có Access-Control-Allow-Origin: *); fetch tự theo chuyển hướng.
+    // Không gửi cookie (credentials mặc định same-origin) để "*" hợp lệ.
+    const res = await fetch(GAS_URL, {
+      method: 'POST', redirect: 'follow', signal: ctl.signal,
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ liff: 1, idToken: idToken, site: site, kind: kind, lat: f.lat, lng: f.lng, accuracy: f.accuracy })
+    });
+    clearTimeout(timer);
+    let r = null; try { r = await res.json(); } catch (e) {}
+    if (!r || !r.title) throw new Error('bad response ' + res.status);
+    showResult(r);
+  } catch (e) {
+    if (e && e.code) return;   // lỗi GPS đã hiện
+    block('Could not reach the server', 'Không gửi được lên máy chủ', 'Check your internet and try again. If it still fails, call the office.', 'Kiểm tra mạng rồi thử lại. Nếu vẫn lỗi, hãy gọi văn phòng.');
+  } finally {
+    busy = false; setButtons();
+    if (fix) onFix({ coords: { latitude: fix.lat, longitude: fix.lng, accuracy: fix.accuracy } });
+  }
+}
+
+/* ===== Khởi động ===== */
+async function main() {
+  $('in').onclick = () => send('vao');
+  $('out').onclick = () => send('ra');
+  if (!window.liff) return block('Cannot load LINE', 'Không tải được LINE', 'Please open this page from LINE.', 'Vui lòng mở trang này từ LINE.');
+  try { await liff.init({ liffId: LIFF_ID }); } catch (e) {
+    return block('Cannot start the page', 'Không khởi động được trang', 'Close this page and scan the QR code again in LINE.', 'Đóng trang này và quét lại mã QR trong LINE.');
+  }
+  site = readSite();
+  $('site').textContent = site || '?';
+  if (!site) return block('Wrong QR code', 'Mã QR không đúng', 'Please scan the QR code at the factory again.', 'Vui lòng quét lại mã QR tại xưởng.');
+  if (!liff.isLoggedIn()) { liff.login({ redirectUri: location.href }); return; }   // mở ngoài LINE: đăng nhập LINE trước
+  if (GAS_URL.indexOf('REPLACE_') >= 0) return block('Page not set up yet', 'Trang chưa cài đặt xong', 'Please call the office.', 'Vui lòng gọi văn phòng.');
+  ready = true;
+  startGps();
+}
+main();
+</script>
+</body>
+</html>
